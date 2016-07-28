@@ -32,122 +32,106 @@
  */
 
 #include <bcc/proto.h>
-
-/* The real return codes are as follows:
- * -1 means "use the default classid from command line".
- * 0 means "no match found".
- * Anything else overrides the default classid.
- * Here we name them after what we really want to do, for more clarity.
- */
-#define DROP    -1
-#define FORWARD 0
-
-/* memset() prototype, to avoid a warning when using it. */
-void * memset(void *, int, unsigned long);
-
-enum states {
-  DEFAULT,
-  STEP_1,
-  STEP_2,
-  OPEN
-};
-
-
-/* Structures for index and value (a.k.a key and leaf) for state table */
-struct StateTableKey {
-  u32 ip_src;
-  u32 ip_dst;
-};
-
-struct StateTableLeaf {
-  int state;
-};
-
-/* Structures for index and value (a.k.a key and leaf) for XFSM stable */
-struct XFSMTableKey {
-  int state;
-  u8  l4_proto;
-  u16 src_port;
-  u16 dst_port;
-};
-
-struct XFSMTableLeaf {
-  int action;
-  int next_state;
-};
-
-
-/* State table */
-BPF_TABLE("hash", struct StateTableKey, struct StateTableLeaf, state_table, 256);
-
-/* XFSM table */
-BPF_TABLE("hash", struct XFSMTableKey, struct XFSMTableLeaf, xfsm_table, 256);
-
+#include <uapi/linux/in.h>
+#include "openstate.h"
 
 int ebpf_filter(struct __sk_buff *skb) {
   u8 *cursor = 0;
   int current_state;
-  u8  l4_proto_nb;
+
+  /* Initialize most fields to 0 in case we do not parse associated headers.
+   * The alternative is to set it to 0 once we know we will not meet the header
+   * (e.g. when we see ARP, we won't have dst IP / port...). It would prevent
+   * to affect a value twice in some cases, but it is prone to error when
+   * adding parsing for other protocols.
+   */
   struct StateTableKey state_idx;
-  struct StateTableLeaf *state_val;
+  // state_idx.ether_type // Will be set anyway
+  state_idx.__padding16 = 0;
+  state_idx.ip_src = 0;
+  state_idx.ip_dst = 0;
+
+  struct XFSMTableKey  xfsm_idx;
+  // xfsm_idx.state // Will be set anyway before XFSM lookup
+  xfsm_idx.l4_proto = 0;
+  xfsm_idx.src_port = 0;
+  xfsm_idx.dst_port = 0;
+  xfsm_idx.__padding8  = 0;
+  xfsm_idx.__padding16 = 0;
+
+  struct ethernet_t *ethernet;
+  struct ip_t       *ip;
+  struct udp_t      *l4;
+
+  /* Headers parsing */
 
   ethernet: {
-    struct ethernet_t *ethernet = cursor_advance(cursor, sizeof(*ethernet));
+    ethernet = cursor_advance(cursor, sizeof(*ethernet));
+    state_idx.ether_type = ethernet->type;
 
     switch (ethernet->type) {
       case ETH_P_IP:   goto ip;
+      case ETH_P_ARP:  goto arp;
       default:         goto EOP;
     }
   }
 
   ip: {
-    struct ip_t *ip = cursor_advance(cursor, sizeof(*ip));
+    ip = cursor_advance(cursor, sizeof(*ip));
     state_idx.ip_src = ip->src;
     state_idx.ip_dst = ip->dst;
 
-    state_val = state_table.lookup(&state_idx);
+    switch (ip->nextp) {
+      case IPPROTO_TCP: goto l4;
+      case IPPROTO_UDP: goto l4;
+      default:          goto statelookup;
+    }
+  }
+
+  arp: {
+    /* We could parse ARP packet here if we needed to retrieve some fields from
+     * the ARP header for the lookup.
+     */
+    goto statelookup;
+  }
+
+  l4: {
+    /* Here We only need dst and src ports from L4, and they are at the same
+     * location for TCP and UDP; so do not switch on cases, just use UDP
+     * cursor.
+     */
+    l4 = cursor_advance(cursor, sizeof(*l4));
+    goto statelookup;
+  }
+
+  /* Tables lookups */
+
+  statelookup: {
+    struct StateTableLeaf *state_val = state_table.lookup(&state_idx);
+
     if (state_val) {
       current_state = state_val->state;
-      l4_proto_nb   = ip->nextp;
-      /* If we found a known state, go on and go to label l4 to prepare XFSM
-       * table lookup.
+      /* If we found a state, go on and search XFSM table for this state and
+       * for current event.
        */
-      switch (current_state) {
-        case OPEN:
-        case STEP_1:
-        case STEP_2:
-        case DEFAULT:
-          goto l4;
-        default:
-          return DROP;
-      }
+      goto xfsmlookup;
     }
     goto EOP;
   }
 
-  l4: {
-    struct XFSMTableKey xfsm_idx;
-    /* Even though we initialize xfsm_idx just below, the verifier complains
-     * about non-initialized stack. Use memset to ensure it's happy.
-     * It seems to be due to the fields of the structure not being aligned on
-     * words (some of them being 8 or 16-bit long).
-     * TODO: Find a way to fix this and to get rid of memset (bad for perf).
-     */
-    memset(&xfsm_idx, 0, sizeof(struct XFSMTableKey));
-    /* Here We only need dst port from L4 (we do not care about src port), and
-     * they are at the same location for TCP and UDP; so do not switch on
-     * cases, just use UDP cursor.
-     */
-    struct udp_t *l4 = cursor_advance(cursor, sizeof(*l4));
+  xfsmlookup: {
+    /* We don't want to match on L4 src port, so set it at 0 here and in XFSM
+     * initialization, since we have no wildcard mechanism. */
     xfsm_idx.state    = current_state;
-    xfsm_idx.l4_proto = l4_proto_nb;
+    xfsm_idx.l4_proto = ip->nextp;
     xfsm_idx.src_port = 0;
     xfsm_idx.dst_port = l4->dport;
+    xfsm_idx.__padding8  = 0;
+    xfsm_idx.__padding16 = 0;
 
     struct XFSMTableLeaf *xfsm_val = xfsm_table.lookup(&xfsm_idx);
 
     if (xfsm_val) {
-
       /* Update state table. We re-use the StateTableKey we had initialized
        * already. We update this rule with the new state provided by XFSM
        * table.
@@ -155,21 +139,35 @@ int ebpf_filter(struct __sk_buff *skb) {
       struct StateTableLeaf new_state = { xfsm_val->next_state };
       state_table.update(&state_idx, &new_state);
 
-      /* At last, return the action for the current state, that we obtained
+      /* At last, execute the action for the current state, that we obtained
        * from the XFSM table.
+       * Users should add new actions here.
        */
-      return xfsm_val->action;
+      switch (xfsm_val->action) {
+        case ACTION_DROP:
+          return TC_CLS_DEFAULT;
+        case ACTION_FORWARD:
+          return TC_CLS_NOMATCH;
+        default:
+          return TC_CLS_NOMATCH; // XXX Should actually return an error code.
+      }
     }
 
     /* So we did not find a match in XFSM table... For port knocking, default
      * action is "return to initial state". We have yet to find a way to
-     * properly implement a default action.
+     * properly implement a default action. XXX
      */
+    enum states {
+      DEFAULT,
+      STEP_1,
+      STEP_2,
+      OPEN
+    };
     struct StateTableLeaf new_state = { DEFAULT };
     state_table.update(&state_idx, &new_state);
-    return DROP;
+    return TC_CLS_DEFAULT;
   }
 
 EOP:
-  return FORWARD;
+  return TC_CLS_NOMATCH;
 }
